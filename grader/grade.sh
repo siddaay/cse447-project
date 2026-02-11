@@ -2,7 +2,7 @@
 set -e
 set -x
 
-DATA=$1
+DATA=$PWD/$1
 OUT=${2:-output}
 mkdir -p $OUT
 
