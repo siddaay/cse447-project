@@ -1,29 +1,34 @@
 #!/usr/bin/env python
+import lzma
 import os
 import pickle
-import sys
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-from collections import defaultdict, Counter
+from typing import Dict, Optional
+import random
+
+from tqdm import tqdm
+
+from ngram import KNCharLM
 
 
 class MyModel:
+    """
+    This is a starter model to get you started. Feel free to modify this file.
+    """
 
-    def __init__(self):
-        self.ngram_models = None
-        self.n = 6
-        self.fallback = [' ', 'e', 't']  # universal fallback chars
+    def __init__(self, ngram_lm: Optional[KNCharLM] = None):
+        self.ngram_lm = ngram_lm or KNCharLM()
 
     @classmethod
-    def load_training_data(cls):
-        # Training is done offline in Colab; we load the saved model instead
-        return []
+    def load_training_data(cls, fnames, subset=None, save_cache=False):
+        return {'fnames': fnames, 'subset': subset, 'save_cache': save_cache}
 
     @classmethod
     def load_test_data(cls, fname):
         data = []
         with open(fname) as f:
             for line in f:
-                inp = line[:-1]  # strip trailing newline
+                inp = line[:-1]  # the last character is a newline
                 data.append(inp)
         return data
 
@@ -33,86 +38,110 @@ class MyModel:
             for p in preds:
                 f.write('{}\n'.format(p))
 
-    def run_train(self, data, work_dir):
-        # Training is done offline; weights are saved to work_dir manually
-        print('Training is done offline. Load pre-trained model with load().')
+    def run_train(self, data: Dict[str, object], work_dir):
+        fnames = data['fnames']
+        subset = data['subset']
+        save_cache = data.get('save_cache', False)
+        for fname in fnames:
+            cache_enabled = fname.endswith('.xz') and save_cache
+            cache_name = os.path.basename(fname[:-3])
+            if cache_enabled and subset is not None:
+                cache_name = f'{cache_name}.subset{subset}'
+            cache_target = os.path.join(work_dir, cache_name) if cache_enabled else None
+            cache_tmp = f'{cache_target}.tmp' if cache_enabled else None
 
-    def predict_top3(self, context):
-        """Predict top 3 next chars using stupid backoff from n down to 1."""
-        for k in range(min(self.n, len(context) + 1), 0, -1):
-            ctx = context[-(k - 1):] if k > 1 else ''
-            if ctx in self.ngram_models[k]:
-                top3 = [c for c, _ in self.ngram_models[k][ctx].most_common(3)]
-                if top3:
-                    # Pad to 3 if fewer candidates exist
-                    for fb in self.fallback:
-                        if len(top3) >= 3:
-                            break
-                        if fb not in top3:
-                            top3.append(fb)
-                    return top3
-        return self.fallback[:]
+            if fname.endswith('.xz'):
+                stream = lzma.open(fname, 'rt', encoding='utf-8', errors='replace')
+            else:
+                stream = open(fname, 'rt')
+
+            cache_file = None
+            if cache_enabled:
+                cache_file = open(cache_tmp, 'wt', encoding='utf-8')
+
+            try:
+                iterator = tqdm(stream, total=subset, desc='Training ngram ({})'.format(os.path.basename(fname)))
+                for idx, line in enumerate(iterator):
+                    if subset is not None and idx >= subset:
+                        break
+                    text = line.rstrip('\n').lower()
+                    self.ngram_lm.update_from_text(text)
+                    if cache_file is not None:
+                        cache_file.write(f'{text}\n')
+            finally:
+                stream.close()
+                if cache_file is not None:
+                    cache_file.close()
+
+            if cache_enabled:
+                os.replace(cache_tmp, cache_target)
+                print('Cached decompressed training text to {}'.format(cache_target))
 
     def run_pred(self, data):
-        """
-        data: list of context strings (one per line from input.txt)
-        returns: list of 3-char prediction strings
-        """
         preds = []
-        for context in data:
-            try:
-                top3 = self.predict_top3(context)
-                # Join into a single 3-char string (as the grader expects)
-                preds.append(''.join(top3[:3]))
-            except Exception as e:
-                print(f'Error on context {repr(context)}: {e}', file=sys.stderr)
-                preds.append(''.join(self.fallback))
+        for inp in data:
+            top_guesses = self.ngram_lm.topk_next(inp, k=3)
+            preds.append(''.join(top_guesses))
         return preds
 
-    def save(self, work_dir):
-        # Model is saved from Colab as ngram_models.pkl — nothing to save here
-        checkpoint_path = os.path.join(work_dir, 'model.checkpoint')
-        with open(checkpoint_path, 'wt') as f:
-            f.write('ngram_model_v1')
-        print(f'Checkpoint marker saved to {checkpoint_path}')
+    @staticmethod
+    def checkpoint_path(work_dir: str, experiment_name: str) -> str:
+        suffix = f'.{experiment_name}' if experiment_name else ''
+        return os.path.join(work_dir, f'model.checkpoint{suffix}')
+
+    def save(self, work_dir, experiment_name=''):
+        checkpoint_path = self.checkpoint_path(work_dir, experiment_name)
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump(self.ngram_lm, f)
+        print('Saved model checkpoint to {}'.format(os.path.abspath(checkpoint_path)))
 
     @classmethod
-    def load(cls, work_dir):
-        model = cls()
-        pkl_path = os.path.join(work_dir, 'ngram_models.pkl')
-        print(f'Loading n-gram model from {pkl_path} ...', file=sys.stderr)
-        with open(pkl_path, 'rb') as f:
-            model.ngram_models = pickle.load(f)
-        print('Model loaded.', file=sys.stderr)
-        return model
+    def load(cls, work_dir, experiment_name=''):
+        checkpoint_path = cls.checkpoint_path(work_dir, experiment_name)
+        with open(checkpoint_path, 'rb') as f:
+            ngram_lm = pickle.load(f)
+        return MyModel(ngram_lm=ngram_lm)
 
 
 if __name__ == '__main__':
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('mode', choices=('train', 'test'), help='what to run')
     parser.add_argument('--work_dir', help='where to save', default='work')
+    parser.add_argument('--train_data', nargs='+', help='path(s) to training data', default=['data/en.txt.subset1000000'])
+    parser.add_argument('--train_subset', type=int, default=None, help='train on first N lines only')
+    parser.add_argument('--save_data_cache', action='store_true', help='save decompressed training cache into work_dir')
     parser.add_argument('--test_data', help='path to test data', default='example/input.txt')
     parser.add_argument('--test_output', help='path to write test predictions', default='pred.txt')
+    parser.add_argument('--experiment_name', default='', help='optional experiment name for checkpoint suffix')
     args = parser.parse_args()
+
+    random.seed(0)
 
     if args.mode == 'train':
         if not os.path.isdir(args.work_dir):
             print('Making working directory {}'.format(args.work_dir))
             os.makedirs(args.work_dir)
+        print('Instatiating model')
         model = MyModel()
-        train_data = MyModel.load_training_data()
+        print('Loading training data from {}'.format(', '.join(args.train_data)))
+        train_data = MyModel.load_training_data(
+            args.train_data,
+            subset=args.train_subset,
+            save_cache=args.save_data_cache,
+        )
+        print('Training')
         model.run_train(train_data, args.work_dir)
-        model.save(args.work_dir)
-
+        print('Saving model')
+        model.save(args.work_dir, experiment_name=args.experiment_name)
     elif args.mode == 'test':
-        model = MyModel.load(args.work_dir)
+        print('Loading model')
+        model = MyModel.load(args.work_dir, experiment_name=args.experiment_name)
+        print('Loading test data from {}'.format(args.test_data))
         test_data = MyModel.load_test_data(args.test_data)
-        print(f'Predicting on {len(test_data)} inputs...', file=sys.stderr)
+        print('Making predictions')
         pred = model.run_pred(test_data)
-        assert len(pred) == len(test_data), \
-            'Expected {} predictions but got {}'.format(len(test_data), len(pred))
-        MyModel.write_pred(pred, args.test_output)
-        print(f'Wrote predictions to {args.test_output}', file=sys.stderr)
-
+        print('Writing predictions to {}'.format(args.test_output))
+        assert len(pred) == len(test_data), 'Expected {} predictions but got {}'.format(len(test_data), len(pred))
+        model.write_pred(pred, args.test_output)
     else:
         raise NotImplementedError('Unknown mode {}'.format(args.mode))
